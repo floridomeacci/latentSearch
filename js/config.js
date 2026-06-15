@@ -1,15 +1,10 @@
 /* ==========================================
    LatentSearch — API Base Configuration
    ==========================================
-   When deploying the frontend to Vercel (static hosting),
-   set API_BASE to the URL of your separately-deployed Python backend.
-   Leave empty ('') when running locally with server.py.
-
-   Example backend hosts: Railway, Render, Fly.io
+   The Python backend is deployed alongside the frontend on Vercel
+   (see api/index.py and vercel.json), so API calls use the same origin.
+   Set this to an absolute URL only if you move the backend to a
+   separate host (Railway, Render, Fly.io, etc.).
    ========================================== */
 
-window.API_BASE = (() => {
-    const h = window.location.hostname;
-    if (h === 'localhost' || h === '127.0.0.1') return '';
-    return 'https://api.latentsearch.net';
-})();
+window.API_BASE = '';
