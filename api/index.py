@@ -46,6 +46,12 @@ class handler(LatentSearchHandler):
 
     def do_GET(self):
         self._prepare()
+        if self.path.startswith("/api/images/stream"):
+            # SSE streaming is unreliable inside Vercel serverless functions and
+            # can hang until timeout. Return 404 so the frontend's EventSource
+            # errors and falls back to POST /api/images.
+            self.send_error(404, "Not Found")
+            return
         if self.path.startswith("/api/"):
             super().do_GET()
         else:
