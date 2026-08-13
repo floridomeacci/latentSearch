@@ -1,120 +1,63 @@
 # LatentSearch
 
-**[Visit latentsearch.net](https://latentsearch.net)**
+[LatentSearch](https://latentsearch.net) is a search-engine experiment where the results are generated at request time instead of retrieved from a crawled index. It can produce text results, image results, and a generated preview for a selected result.
 
-An AI-powered search engine experiment. Generates search results, images, and page previews on the fly using large language models — no crawled index, pure inference.
+[![LatentSearch preview](assets/preview.png)](https://latentsearch.net)
 
-Made by [floridomeacci.xyz](https://floridomeacci.xyz)
+## How it works
 
+The browser sends a query to the Python API. The API keeps provider credentials on the server, moderates the query, requests generated results from Replicate, and returns the response to the browser. Text search, images, and page previews use separate model endpoints.
 
-## Preview
+## Tech stack
 
-[![Preview](assets/preview.png)](https://latentsearch.net)
-
----
-
-## Stack
-
-| Layer | Tech |
+| Area | Technology |
 |---|---|
-| Frontend | Vanilla HTML / CSS / JS |
-| Backend | Python 3 (`http.server`) |
-| Text results | Meta Llama 4 Scout via Replicate |
-| Image results | z-image-turbo via Replicate |
-| Moderation | Llama Guard 3 via Replicate |
-| Page preview | DeepSeek V3 via Replicate |
-| Haptics | [web-haptics](https://github.com/pbakaus/web-haptics) |
+| Interface | Vanilla HTML, CSS, and JavaScript |
+| Local server | Python 3 standard library and `ThreadingHTTPServer` |
+| Serverless adapter | Python on Vercel |
+| Text generation | Meta Llama 4 Scout through Replicate |
+| Image generation | z-image-turbo through Replicate |
+| Page previews | DeepSeek V3 through Replicate |
+| Moderation | Llama Guard 3 through Replicate |
+| Touch feedback | web-haptics |
 
----
+## Run locally
 
-## Setup
+The server has no third-party Python dependencies.
 
-### 1. Clone
-
-```sh
-git clone https://github.com/floridomeacci/latentsearch.git
-cd latentsearch
-```
-
-### 2. Configure API key
-
-```sh
+```bash
+git clone https://github.com/floridomeacci/latentSearch.git
+cd latentSearch
 cp .env.example .env
-# Edit .env and set your Replicate API token
+python3 server.py
 ```
 
-Get a token at [replicate.com](https://replicate.com). **Never commit `.env`.**
+Add a valid `REPLICATE_API_TOKEN` to `.env`, then open <http://localhost:8180>. Do not commit `.env` or any generated request logs.
 
-### 3. Create Python environment
+## Configuration
 
-```sh
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt   # no external deps needed — stdlib only
+| Variable | Purpose | Default |
+|---|---|---|
+| `REPLICATE_API_TOKEN` | Required provider token | None |
+| `ADMIN_TOKEN` | Protects the local search-log endpoint | Disabled when empty |
+| `PORT` | Local HTTP port | `8180` |
+| `DAILY_SEARCH_LIMIT` | Daily text-search cap | `500` |
+| `DAILY_PAGE_LIMIT` | Daily page-preview cap | `200` |
+| `DAILY_IMAGE_LIMIT` | Daily image-request cap | `400` |
+| `GEN_LOG_FILE` | Generated-content log path | `query_generations.log` |
+
+The application also applies a per-IP request limit and response security headers. These controls supplement, but do not replace, protection at the hosting layer.
+
+## Project structure
+
+```text
+api/index.py   Vercel adapter for the Python handler
+server.py      API proxy, local server, moderation, and request limits
+index.html     Search home page
+search.html    Text-results page
+images.html    Image-results page
+js/            Browser behavior and API client code
+css/           Site styles
 ```
 
-### 4. Run
-
-```sh
-.venv/bin/python server.py
-# → http://localhost:8080
-```
-
----
-
-## Security
-
-- **API key** is server-side only — never sent to the browser
-- **Rate limiting** — 20 API requests per IP per 60 seconds (returns `429`)
-- **Security headers** on every response: `X-Frame-Options`, `X-Content-Type-Options`, `Content-Security-Policy`, `Referrer-Policy`, `Permissions-Policy`
-- **Content moderation** — every query is checked by Llama Guard before processing
-
-### Cloudflare (recommended for production)
-
-Proxy the server behind Cloudflare for:
-- DDoS protection & bot management (enable **Bot Fight Mode**)
-- WAF rules — block common attack patterns
-- Rate limiting rules at the edge (supplement the in-app limiter)
-- Automatic HTTPS
-
-Recommended Cloudflare WAF rules (free tier):
-1. Block known bad bots — `(cf.client.bot)` → Block
-2. Challenge non-browser requests — `(not http.request.version in {"HTTP/2" "HTTP/3"})` → JS Challenge
-3. Rate limit `/api/*` — 30 requests / 10 seconds per IP → Block
-
----
-
-## Project Structure
-
-```
-index.html        Home page
-search.html       Text results page
-images.html       Image results page
-server.py         Python backend (API proxy + static files)
-css/style.css     All styles
-js/app.js         Shared JS (autocomplete, i18n, buttons)
-js/search.js      Results page JS
-js/haptics.js     Haptic feedback (mobile)
-.env.example      Environment variable template
-```
-
----
-
-## License
-
-MIT
-
-
----
-
-## Tech Stack
-
-The tools and technologies used in this project:
-
-[![My Skills](https://skillicons.dev/icons?i=py,js,html,css)](https://skillicons.dev)
-
-## Support
-
-If you found this project useful or interesting, consider buying me a coffee!
-
-[![Buy Me A Coffee](https://img.shields.io/badge/Buy_Me_A_Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/floridomeacci)
+The Vercel configuration serves static files from the repository and rewrites `/api/*` requests to the Python adapter.
