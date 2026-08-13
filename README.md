@@ -21,6 +21,8 @@ The browser sends a query to the Python API. The API keeps provider credentials 
 | Moderation | Llama Guard 3 through Replicate |
 | Touch feedback | web-haptics |
 
+[![Tech stack: Python, JavaScript, HTML, and CSS](https://skillicons.dev/icons?i=py,js,html,css)](https://skillicons.dev)
+
 ## Run locally
 
 The server has no third-party Python dependencies.
@@ -61,3 +63,7 @@ css/           Site styles
 ```
 
 The Vercel configuration serves static files from the repository and rewrites `/api/*` requests to the Python adapter.
+
+## Support
+
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy_Me_A_Coffee-FFDD00?style=for-the-badge&logo=buy-me-a-coffee&logoColor=black)](https://buymeacoffee.com/floridomeacci)
