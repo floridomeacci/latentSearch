@@ -7,4 +7,4 @@
    separate host (Railway, Render, Fly.io, etc.).
    ========================================== */
 
-window.API_BASE = '';
+window.API_BASE = 'https://api.latentsearch.net';

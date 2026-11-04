@@ -10,6 +10,7 @@ import re
 import mimetypes
 import time
 import random
+import sqlite3
 import threading
 import collections
 from http.server import HTTPServer, ThreadingHTTPServer, SimpleHTTPRequestHandler
@@ -83,6 +84,60 @@ _SEARCH_LOG_MAX = 10_000        # cap in-memory list
 GEN_LOG_FILE = os.environ.get("GEN_LOG_FILE", "query_generations.log")
 _gen_log_lock = threading.Lock()
 
+# Persistent query database (SQLite) — survives restarts, queryable/exportable.
+DB_FILE = os.environ.get("QUERY_DB_FILE", "queries.db")
+_db_lock = threading.Lock()
+
+
+def _db_init() -> None:
+    """Create the queries table if it does not exist."""
+    with _db_lock:
+        conn = sqlite3.connect(DB_FILE)
+        try:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS queries (
+                    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts          TEXT NOT NULL,
+                    ip          TEXT,
+                    endpoint    TEXT NOT NULL,
+                    query       TEXT,
+                    page        INTEGER,
+                    result_count INTEGER,
+                    details     TEXT
+                )
+                """
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+
+def _db_log(entry: dict) -> None:
+    """Insert one query record into the SQLite database."""
+    try:
+        with _db_lock:
+            conn = sqlite3.connect(DB_FILE)
+            try:
+                conn.execute(
+                    "INSERT INTO queries (ts, ip, endpoint, query, page, result_count, details)"
+                    " VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        entry.get("ts"),
+                        entry.get("ip"),
+                        entry.get("endpoint", "search"),
+                        entry.get("query"),
+                        entry.get("page"),
+                        entry.get("result_count"),
+                        json.dumps(entry.get("details", {}), ensure_ascii=False),
+                    ),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+    except Exception as exc:
+        print(f"[db] could not write {DB_FILE}: {exc}")
+
 
 def _log_search(ip: str, query: str) -> None:
     """Append a search entry to the in-memory list and to searches.log on disk."""
@@ -96,16 +151,32 @@ def _log_search(ip: str, query: str) -> None:
             fh.write(json.dumps(entry) + "\n")
     except OSError as exc:
         print(f"[log] could not write searches.log: {exc}")
+    _db_log({"ts": entry["ts"], "ip": ip, "endpoint": "search", "query": query})
 
 
 def _append_generation_log(entry: dict) -> None:
-    """Append one JSON entry to the query+generation log file."""
+    """Append one JSON entry to the query+generation log file and SQLite DB."""
     try:
         with _gen_log_lock:
             with open(GEN_LOG_FILE, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
     except OSError as exc:
         print(f"[log] could not write {GEN_LOG_FILE}: {exc}")
+
+    query = entry.get("query")
+    db_query = query if isinstance(query, str) else (
+        (query or {}).get("url") if isinstance(query, dict) else str(query)
+    )
+    gen = entry.get("generated") or {}
+    _db_log({
+        "ts": entry.get("ts"),
+        "ip": entry.get("ip"),
+        "endpoint": entry.get("endpoint", "search"),
+        "query": db_query,
+        "page": entry.get("page"),
+        "result_count": gen.get("result_count") if isinstance(gen, dict) else None,
+        "details": gen,
+    })
 
 
 def _log_search_generation(ip: str, query: str, page: int, results: list) -> None:
@@ -781,8 +852,10 @@ class LatentSearchHandler(SimpleHTTPRequestHandler):
                 self._handle_page_content()
             elif self.path.startswith("/api/admin/searches"):
                 self._handle_admin_searches()
+            elif self.path.startswith("/api/admin/queries"):
+                self._handle_admin_queries()
             else:
-                super().do_GET()
+                self.send_error(404, "Not Found")
         except Exception as exc:
             print(f"[error] GET {self.path}: {exc}")
 
@@ -798,6 +871,55 @@ class LatentSearchHandler(SimpleHTTPRequestHandler):
         with _search_log_lock:
             entries = list(_search_log[-limit:])
         self._send_json({"count": len(entries), "searches": entries})
+
+    def _handle_admin_queries(self):
+        """Return the full persistent query history from SQLite as JSON. Requires ?token=ADMIN_TOKEN."""
+        parsed = urlparse(self.path)
+        params = parse_qs(parsed.query)
+        token = params.get("token", [""])[0]
+        if not ADMIN_TOKEN or token != ADMIN_TOKEN:
+            self._send_json({"error": "Forbidden"}, 403)
+            return
+        try:
+            limit = int(params.get("limit", ["10000"])[0])
+            endpoint = params.get("endpoint", [""])[0]
+        except ValueError:
+            self._send_json({"error": "Invalid limit"}, 400)
+            return
+        try:
+            with _db_lock:
+                conn = sqlite3.connect(DB_FILE)
+                try:
+                    if endpoint:
+                        rows = conn.execute(
+                            "SELECT ts, ip, endpoint, query, page, result_count, details"
+                            " FROM queries WHERE endpoint = ? ORDER BY id DESC LIMIT ?",
+                            (endpoint, limit),
+                        ).fetchall()
+                    else:
+                        rows = conn.execute(
+                            "SELECT ts, ip, endpoint, query, page, result_count, details"
+                            " FROM queries ORDER BY id DESC LIMIT ?",
+                            (limit,),
+                        ).fetchall()
+                finally:
+                    conn.close()
+        except Exception as exc:
+            self._send_json({"error": str(exc)}, 500)
+            return
+        entries = [
+            {
+                "ts": r[0],
+                "ip": r[1],
+                "endpoint": r[2],
+                "query": r[3],
+                "page": r[4],
+                "result_count": r[5],
+                "details": json.loads(r[6]) if r[6] else None,
+            }
+            for r in rows
+        ]
+        self._send_json({"count": len(entries), "queries": entries})
 
     def do_POST(self):
         try:
@@ -915,6 +1037,15 @@ class LatentSearchHandler(SimpleHTTPRequestHandler):
                 return
 
             print(f"[images] q={query!r} page={page} count={count}")
+            client_ip = self._client_ip()
+            _db_log({
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "ip": client_ip,
+                "endpoint": "images",
+                "query": query,
+                "page": int(page),
+                "result_count": int(count),
+            })
             results = generate_image_results(query, page, count)
             self._send_json(results)
         except Exception as exc:
@@ -954,6 +1085,14 @@ class LatentSearchHandler(SimpleHTTPRequestHandler):
         self.end_headers()
 
         print(f"[images/stream] q={query!r} page={page} count={count}")
+        _db_log({
+            "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "ip": self._client_ip(),
+            "endpoint": "images_stream",
+            "query": query,
+            "page": page,
+            "result_count": count,
+        })
         offset = (page - 1) * count
         for i in range(count):
             result = generate_single_image(query, offset + i, steps)
@@ -1007,6 +1146,7 @@ class LatentSearchHandler(SimpleHTTPRequestHandler):
 
 if __name__ == "__main__":
     PORT = int(os.environ.get("PORT", "8180"))
+    _db_init()
     server = ThreadingHTTPServer(("", PORT), LatentSearchHandler)
     print(f"🔍 LatentSearch server running at http://localhost:{PORT}")
     if API_TOKEN:
