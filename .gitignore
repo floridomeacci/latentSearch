@@ -1,5 +1,11 @@
 # Secrets — never commit
 .env
+tok.txt
+
+# Query logs & database
+*.log
+queries.db
+queries.db-*
 
 # Python
 __pycache__/
