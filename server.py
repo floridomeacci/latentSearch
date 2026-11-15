@@ -263,29 +263,49 @@ load_local_env()
 API_TOKEN = os.environ.get("REPLICATE_API_TOKEN")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
-TEXT_MODEL_URL = "https://api.replicate.com/v1/models/openai/gpt-4o-mini/predictions"
+# Text generation runs directly against the DeepSeek API (cheaper, not deprecated).
+DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY", "")
+DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
+DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+
+# Image generation still runs on Replicate (DeepSeek has no image model).
 IMAGE_MODEL_URL = "https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions"
-# meta/llama-guard-* models were removed from Replicate; reuse the text model for safety classification.
-MODERATION_MODEL_URL = TEXT_MODEL_URL
-PAGE_MODEL_URL = TEXT_MODEL_URL
 
 
-def _text_payload(prompt: str, system_prompt: str = "You are a helpful assistant.",
-                  max_tokens: int = 700, temperature: float = 0.7,
-                  top_p: float = 1.0, presence_penalty: float = 0.2,
-                  frequency_penalty: float = 0.2) -> dict:
-    """Build a Replicate input payload compatible with the text model (gpt-4o-mini)."""
-    return {
-        "input": {
-            "prompt": prompt,
-            "system_prompt": system_prompt,
-            "max_completion_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "presence_penalty": presence_penalty,
-            "frequency_penalty": frequency_penalty,
+def call_deepseek(messages: list, temperature: float = 0.7, max_tokens: int = 700,
+                  top_p: float = 1.0) -> dict:
+    """Call the DeepSeek chat-completions API. Returns {"content": ...} or {"error": ...}."""
+    if not DEEPSEEK_API_KEY:
+        return {
+            "error": "Missing DEEPSEEK_API_KEY. Set it in the environment or .env file.",
         }
+
+    payload = {
+        "model": DEEPSEEK_MODEL,
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "top_p": top_p,
+        "stream": False,
     }
+    body = json.dumps(payload).encode()
+    req = Request(DEEPSEEK_API_URL, data=body, method="POST")
+    req.add_header("Authorization", f"Bearer {DEEPSEEK_API_KEY}")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urlopen(req, timeout=120) as resp:
+            data = json.loads(resp.read())
+    except HTTPError as e:
+        error_body = e.read().decode() if e.fp else str(e)
+        print(f"[DeepSeek error] {e.code}: {error_body}")
+        return {"error": error_body, "status": e.code}
+    except Exception as exc:
+        return {"error": str(exc)}
+
+    try:
+        return {"content": data["choices"][0]["message"]["content"]}
+    except (KeyError, IndexError, TypeError):
+        return {"error": "Unexpected DeepSeek response", "raw": json.dumps(data)[:500]}
 
 
 def parse_results_from_model_output(output) -> dict | None:
@@ -410,19 +430,20 @@ def call_replicate(url: str, payload: dict, max_polls: int = 60) -> dict:
 
 def moderate_query(query: str) -> dict:
     """Run safety classification and return whether query is safe."""
-    payload = _text_payload(
-        prompt=query,
-        system_prompt=(
-            "You are a content safety classifier. Decide whether the user query is "
-            "safe or unsafe. Reply with exactly one word: 'safe' or 'unsafe'."
-        ),
-        max_tokens=10,
+    resp = call_deepseek(
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "You are a content safety classifier. Decide whether the user query is "
+                    "safe or unsafe. Reply with exactly one word: 'safe' or 'unsafe'."
+                ),
+            },
+            {"role": "user", "content": query},
+        ],
         temperature=0,
-        top_p=1.0,
-        presence_penalty=0,
-        frequency_penalty=0,
+        max_tokens=10,
     )
-    resp = call_replicate(MODERATION_MODEL_URL, payload)
     if resp.get("error"):
         return {
             "safe": True,
@@ -431,14 +452,7 @@ def moderate_query(query: str) -> dict:
             "reason": resp.get("error", "Moderation failed"),
         }
 
-    output = resp.get("output")
-    if isinstance(output, list):
-        text = "".join(str(part) for part in output).strip()
-    elif output is None:
-        text = ""
-    else:
-        text = str(output).strip()
-
+    text = str(resp.get("content", "")).strip()
     normalized = text.lower()
     first_line = normalized.splitlines()[0].strip() if normalized else ""
     is_unsafe = first_line.startswith("unsafe") or normalized.startswith("unsafe")
@@ -526,20 +540,21 @@ Rules:
 - Use recent dates in Feb-Mar 2026 when dates are present
 - Return JSON only, no markdown"""
 
-        payload = _text_payload(
-            prompt=prompt,
-            system_prompt="You are a helpful assistant.",
-            max_tokens=batch_config["max_tokens"],
+        response = call_deepseek(
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant that generates realistic search engine results as JSON.",
+                },
+                {"role": "user", "content": prompt},
+            ],
             temperature=batch_config["temperature"],
-            top_p=1.0,
-            presence_penalty=0.2,
-            frequency_penalty=0.2,
+            max_tokens=batch_config["max_tokens"],
         )
-        response = call_replicate(TEXT_MODEL_URL, payload)
         if response.get("error"):
             return {"error": response["error"], "results": []}
 
-        parsed = parse_results_from_model_output(response.get("output"))
+        parsed = parse_results_from_model_output(response.get("content"))
         if parsed and isinstance(parsed.get("results"), list):
             return {"results": parsed["results"]}
         return {"error": "Failed to parse batch", "results": []}
@@ -582,17 +597,18 @@ Rules:
         fallback_prompt = f"""Return only minified JSON with shape {{"results":[...]}}.
 Generate exactly {remaining} additional realistic and different search results for query '{query}' page {page}.
 Use varied snippet lengths and avoid duplicates from common top sites. JSON only."""
-        fallback_payload = _text_payload(
-            prompt=fallback_prompt,
-            system_prompt="You are a helpful assistant.",
-            max_tokens=600,
+        fallback_resp = call_deepseek(
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a helpful assistant that generates realistic search engine results as JSON.",
+                },
+                {"role": "user", "content": fallback_prompt},
+            ],
             temperature=0.9,
-            top_p=1.0,
-            presence_penalty=0.3,
-            frequency_penalty=0.3,
+            max_tokens=600,
         )
-        fallback_resp = call_replicate(TEXT_MODEL_URL, fallback_payload)
-        fallback_parsed = parse_results_from_model_output(fallback_resp.get("output"))
+        fallback_parsed = parse_results_from_model_output(fallback_resp.get("content"))
         if fallback_parsed and isinstance(fallback_parsed.get("results"), list):
             for result in fallback_parsed["results"]:
                 domain = str(result.get("domain", "")).strip().lower()
@@ -777,23 +793,22 @@ def generate_page_content(url: str, title: str, snippet: str) -> dict:
         '"footer":"short footer text"}\n\n'
         "Write specific, credible content matching the topic. No lorem ipsum."
     )
-    payload = _text_payload(
-        prompt=full_prompt,
-        system_prompt="You are a helpful assistant.",
-        max_tokens=900,
+    resp = call_deepseek(
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a helpful assistant that writes realistic website content as JSON.",
+            },
+            {"role": "user", "content": full_prompt},
+        ],
         temperature=0.6,
+        max_tokens=900,
         top_p=0.9,
-        presence_penalty=0.2,
-        frequency_penalty=0.2,
     )
-    resp = call_replicate(TEXT_MODEL_URL, payload, max_polls=40)
     if resp.get("error"):
         return {"error": resp["error"]}
 
-    output = resp.get("output", [])
-    if isinstance(output, list):
-        output = "".join(output)
-    output = output.strip()
+    output = str(resp.get("content", "")).strip()
 
     # Strip markdown code fences if present
     if output.startswith("```"):
