@@ -263,10 +263,29 @@ load_local_env()
 API_TOKEN = os.environ.get("REPLICATE_API_TOKEN")
 ADMIN_TOKEN = os.environ.get("ADMIN_TOKEN", "")
 
-TEXT_MODEL_URL = "https://api.replicate.com/v1/models/meta/llama-4-scout-instruct/predictions"
-IMAGE_MODEL_URL = "https://api.replicate.com/v1/models/prunaai/z-image-turbo/predictions"
-MODERATION_MODEL_URL = "https://api.replicate.com/v1/models/meta/llama-guard-3-8b/predictions"
-PAGE_MODEL_URL = "https://api.replicate.com/v1/models/deepseek-ai/deepseek-v3/predictions"
+TEXT_MODEL_URL = "https://api.replicate.com/v1/models/openai/gpt-4o-mini/predictions"
+IMAGE_MODEL_URL = "https://api.replicate.com/v1/models/black-forest-labs/flux-schnell/predictions"
+# meta/llama-guard-* models were removed from Replicate; reuse the text model for safety classification.
+MODERATION_MODEL_URL = TEXT_MODEL_URL
+PAGE_MODEL_URL = TEXT_MODEL_URL
+
+
+def _text_payload(prompt: str, system_prompt: str = "You are a helpful assistant.",
+                  max_tokens: int = 700, temperature: float = 0.7,
+                  top_p: float = 1.0, presence_penalty: float = 0.2,
+                  frequency_penalty: float = 0.2) -> dict:
+    """Build a Replicate input payload compatible with the text model (gpt-4o-mini)."""
+    return {
+        "input": {
+            "prompt": prompt,
+            "system_prompt": system_prompt,
+            "max_completion_tokens": max_tokens,
+            "temperature": temperature,
+            "top_p": top_p,
+            "presence_penalty": presence_penalty,
+            "frequency_penalty": frequency_penalty,
+        }
+    }
 
 
 def parse_results_from_model_output(output) -> dict | None:
@@ -390,12 +409,19 @@ def call_replicate(url: str, payload: dict, max_polls: int = 60) -> dict:
 
 
 def moderate_query(query: str) -> dict:
-    """Run Llama Guard moderation and return whether query is safe."""
-    payload = {
-        "input": {
-            "prompt": query,
-        }
-    }
+    """Run safety classification and return whether query is safe."""
+    payload = _text_payload(
+        prompt=query,
+        system_prompt=(
+            "You are a content safety classifier. Decide whether the user query is "
+            "safe or unsafe. Reply with exactly one word: 'safe' or 'unsafe'."
+        ),
+        max_tokens=10,
+        temperature=0,
+        top_p=1.0,
+        presence_penalty=0,
+        frequency_penalty=0,
+    )
     resp = call_replicate(MODERATION_MODEL_URL, payload)
     if resp.get("error"):
         return {
@@ -500,21 +526,15 @@ Rules:
 - Use recent dates in Feb-Mar 2026 when dates are present
 - Return JSON only, no markdown"""
 
-        payload = {
-            "input": {
-                "top_k": 50,
-                "top_p": 1,
-                "prompt": prompt,
-                "max_tokens": batch_config["max_tokens"],
-                "min_tokens": 0,
-                "temperature": batch_config["temperature"],
-                "system_prompt": "You are a helpful assistant.",
-                "stop_sequences": "",
-                "prompt_template": "",
-                "presence_penalty": 0.2,
-                "frequency_penalty": 0.2,
-            }
-        }
+        payload = _text_payload(
+            prompt=prompt,
+            system_prompt="You are a helpful assistant.",
+            max_tokens=batch_config["max_tokens"],
+            temperature=batch_config["temperature"],
+            top_p=1.0,
+            presence_penalty=0.2,
+            frequency_penalty=0.2,
+        )
         response = call_replicate(TEXT_MODEL_URL, payload)
         if response.get("error"):
             return {"error": response["error"], "results": []}
@@ -562,21 +582,15 @@ Rules:
         fallback_prompt = f"""Return only minified JSON with shape {{"results":[...]}}.
 Generate exactly {remaining} additional realistic and different search results for query '{query}' page {page}.
 Use varied snippet lengths and avoid duplicates from common top sites. JSON only."""
-        fallback_payload = {
-            "input": {
-                "top_k": 50,
-                "top_p": 1,
-                "prompt": fallback_prompt,
-                "max_tokens": 600,
-                "min_tokens": 0,
-                "temperature": 0.9,
-                "system_prompt": "You are a helpful assistant.",
-                "stop_sequences": "",
-                "prompt_template": "",
-                "presence_penalty": 0.3,
-                "frequency_penalty": 0.3,
-            }
-        }
+        fallback_payload = _text_payload(
+            prompt=fallback_prompt,
+            system_prompt="You are a helpful assistant.",
+            max_tokens=600,
+            temperature=0.9,
+            top_p=1.0,
+            presence_penalty=0.3,
+            frequency_penalty=0.3,
+        )
         fallback_resp = call_replicate(TEXT_MODEL_URL, fallback_payload)
         fallback_parsed = parse_results_from_model_output(fallback_resp.get("output"))
         if fallback_parsed and isinstance(fallback_parsed.get("results"), list):
@@ -673,19 +687,19 @@ def generate_single_image(query: str, variation: int, steps: int = 3) -> dict:
         "film grain and analog texture",
     ]
 
-    size_variations = [
-        (320, 320),
-        (384, 320),
-        (320, 384),
-        (400, 320),
-        (320, 400),
-        (360, 360),
-        (432, 288),
-        (288, 432),
-        (448, 320),
-        (320, 448),
-        (416, 312),
-        (312, 416),
+    aspect_ratios = [
+        "1:1",
+        "4:3",
+        "3:4",
+        "16:9",
+        "9:16",
+        "3:2",
+        "2:3",
+        "4:5",
+        "5:4",
+        "21:9",
+        "1:1",
+        "3:4",
     ]
 
     style = rng.choice(medium_styles)
@@ -693,7 +707,7 @@ def generate_single_image(query: str, variation: int, steps: int = 3) -> dict:
     lighting = rng.choice(lighting_setups)
     composition = rng.choice(composition_setups)
     grade = rng.choice(color_grades)
-    width, height = size_variations[variation % len(size_variations)]
+    aspect_ratio = aspect_ratios[variation % len(aspect_ratios)]
 
     prompt = (
         f"{query}, {style}, {camera}, {lighting}, {composition}, {grade}, "
@@ -702,14 +716,14 @@ def generate_single_image(query: str, variation: int, steps: int = 3) -> dict:
 
     payload = {
         "input": {
-            "width": width,
-            "height": height,
             "prompt": prompt,
-            "go_fast": False,
+            "aspect_ratio": aspect_ratio,
+            "num_outputs": 1,
+            "go_fast": True,
             "output_format": "jpg",
-            "guidance_scale": 0,
             "output_quality": 80,
             "num_inference_steps": steps,
+            "disable_safety_checker": False,
         }
     }
     resp = call_replicate(IMAGE_MODEL_URL, payload)
@@ -727,8 +741,7 @@ def generate_single_image(query: str, variation: int, steps: int = 3) -> dict:
         "url": image_url,
         "title": f"{query} — {style}",
         "source": f"{style} / {lighting}",
-        "width": width,
-        "height": height,
+        "aspect_ratio": aspect_ratio,
         "index": variation,
     }
 
@@ -764,14 +777,15 @@ def generate_page_content(url: str, title: str, snippet: str) -> dict:
         '"footer":"short footer text"}\n\n'
         "Write specific, credible content matching the topic. No lorem ipsum."
     )
-    payload = {
-        "input": {
-            "prompt": full_prompt,
-            "max_tokens": 900,
-            "temperature": 0.6,
-            "top_p": 0.9,
-        }
-    }
+    payload = _text_payload(
+        prompt=full_prompt,
+        system_prompt="You are a helpful assistant.",
+        max_tokens=900,
+        temperature=0.6,
+        top_p=0.9,
+        presence_penalty=0.2,
+        frequency_penalty=0.2,
+    )
     resp = call_replicate(TEXT_MODEL_URL, payload, max_polls=40)
     if resp.get("error"):
         return {"error": resp["error"]}
